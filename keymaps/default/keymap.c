@@ -361,17 +361,14 @@ static void render_left_oled(void) {
     oled_set_cursor(0, 2);
     oled_write(g_keylog.queue, false);
 
+    // CAPS/TAB status -- WPM already lives on the right screen, no need to
+    // duplicate it here (this row previously still had leftover wpm+bar code
+    // from before this screen was redesigned -- that was the bug).
     oled_set_cursor(0, 3);
-    oled_write_P(PSTR("wpm "), false);
-    char buf[4];
-    buf[0] = wpm >= 100 ? '0' + (wpm / 100)     : ' ';
-    buf[1] = wpm >= 10  ? '0' + (wpm / 10) % 10 : ' ';
-    buf[2] = '0' + wpm % 10;
-    buf[3] = '\0';
-    oled_write(buf, false);
-    // Bar fills the rest of the text budget only (8..15 -> px48..95), stopping
-    // well short of the sprite at px96 rather than running the full panel width.
-    draw_wpm_bar(wpm, 3, 8 * OLED_FONT_WIDTH, (LEFT_TEXT_CHARS - 8) * OLED_FONT_WIDTH);
+    const led_t led = host_keyboard_led_state();
+    oled_write_P(led.caps_lock ? PSTR("CAPS") : PSTR("    "), false);
+    oled_write_P(tab_held      ? PSTR(" TAB")   : PSTR("    "), false);
+    oled_write_P(PSTR("        "), false);   // pad to 16 (4+4+8)
 }
 
 bool oled_task_user(void) {
