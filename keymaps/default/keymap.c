@@ -199,6 +199,11 @@ static void keylog_push(uint16_t keycode) {
         strncpy(g_keylog.current, key_name(keycode), sizeof(g_keylog.current) - 1);
         g_keylog.current[sizeof(g_keylog.current) - 1] = '\0';
     }
+    // TEMP DEBUG: print exactly what this call computed, viewable live via
+    // `qmk console`. Independent of OLED rendering/sync -- this runs at the
+    // moment of the keypress itself, before the RPC send to the slave.
+    uprintf("keylog_push kc=0x%04X printable=%c current=%s\n",
+            keycode, c ? c : '-', g_keylog.current);
 }
 
 void keylog_sync_handler(uint8_t in_size, const void *in, uint8_t out_size, void *out) {
