@@ -3,6 +3,8 @@
 
 #include QMK_KEYBOARD_H
 #include "sprite.h"
+#include "transactions.h"
+#include <string.h>
 
 // ---------------------------------------------------------------------------
 // RIGHT half of Keymo Crone -- confirmed 21/21 on the very first sweep, zero
@@ -100,6 +102,35 @@ oled_rotation_t oled_init_user(oled_rotation_t rotation) {
 // Read on both halves regardless of which physical Tab key is pressed --
 // process_record_user runs identically wherever the keypress originates.
 static bool tab_held = false;
+
+// ---------------------------------------------------------------------------
+// STEP 1 of the keystroke-feed rebuild: bare RPC plumbing only. Sends a fixed
+// 1-byte heartbeat from master to slave every 250ms. No rendering changes yet
+// -- the point is to isolate whether the custom-RPC mechanism itself is what
+// crashed the board when TRRS was connected, before adding back any of the
+// actual keylog data or left-screen UI changes.
+// ---------------------------------------------------------------------------
+static uint8_t heartbeat = 0;
+
+void keylog_sync_handler(uint8_t in_size, const void *in, uint8_t out_size, void *out) {
+    if (in_size == sizeof(heartbeat)) {
+        memcpy(&heartbeat, in, sizeof(heartbeat));
+    }
+}
+
+void keyboard_post_init_user(void) {
+    transaction_register_rpc(RPC_ID_KEYLOG_SYNC, keylog_sync_handler);
+}
+
+void housekeeping_task_user(void) {
+    if (!is_keyboard_master()) return;
+    static uint32_t last_sync = 0;
+    if (timer_elapsed32(last_sync) > 250) {
+        heartbeat++;
+        transaction_rpc_send(RPC_ID_KEYLOG_SYNC, sizeof(heartbeat), &heartbeat);
+        last_sync = timer_read32();
+    }
+}
 
 bool process_record_user(uint16_t keycode, keyrecord_t *record) {
     if (keycode == KC_TAB) {
