@@ -104,37 +104,133 @@ oled_rotation_t oled_init_user(oled_rotation_t rotation) {
 static bool tab_held = false;
 
 // ---------------------------------------------------------------------------
-// STEP 1 of the keystroke-feed rebuild: bare RPC plumbing only. Sends a fixed
-// 1-byte heartbeat from master to slave every 250ms. No rendering changes yet
-// -- the point is to isolate whether the custom-RPC mechanism itself is what
-// crashed the board when TRRS was connected, before adding back any of the
-// actual keylog data or left-screen UI changes.
+// STEP 2 of the keystroke-feed rebuild: real data. Step 1 (bare RPC plumbing,
+// heartbeat only) was flashed identically to both boards, tested with TRRS
+// connected, and was STABLE -- pointing at the original crash being a
+// firmware MISMATCH between the two halves, not a bug in the RPC mechanism
+// itself. This step restores the actual "current key" + rolling queue.
 // ---------------------------------------------------------------------------
-static uint8_t heartbeat = 0;
+#define KEYLOG_LEN 16
+
+typedef struct __attribute__((packed)) {
+    char queue[KEYLOG_LEN + 1];   // rolling printable-character history
+    char current[5];              // short name of the most recent key
+} keylog_sync_t;
+
+static keylog_sync_t g_keylog = {"", ""};
+
+// Printable text for the queue -- only characters that make sense in a rolling
+// typing trail. Covers exactly the keycodes this keymap actually uses; keys
+// outside that set fall through to key_name() below instead.
+static char keylog_char(uint16_t keycode, bool shifted) {
+    if (keycode >= KC_A && keycode <= KC_Z) {
+        return (shifted ? 'A' : 'a') + (keycode - KC_A);
+    }
+    if (keycode >= KC_1 && keycode <= KC_9) return '1' + (keycode - KC_1);
+    if (keycode == KC_0)    return '0';
+    if (keycode == KC_SPC)  return ' ';
+    switch (keycode) {
+        case KC_COMM: return shifted ? '<' : ',';
+        case KC_DOT:  return shifted ? '>' : '.';
+        case KC_SLSH: return shifted ? '?' : '/';
+        case KC_SCLN: return shifted ? ':' : ';';
+        case KC_QUOT: return shifted ? '"' : '\'';
+        case KC_MINS: return shifted ? '_' : '-';
+        case KC_EQL:  return shifted ? '+' : '=';
+    }
+    return 0;   // not a printable key -- caller shows a short name instead
+}
+
+// Short label for non-printable keys, so "current key" is still readable for
+// modifiers, thumbs, and navigation. Only applied to BASIC (non-wrapped)
+// keycodes -- Raise-layer combos like LCTL(KC_W) fall through to the F-key
+// check below using their real value, not a masked one, since masking with
+// `& 0xFF` was WRONG last time (it broke the F1-F12 range comparison that
+// follows the switch, comparing an unmasked keycode against masked cases).
+static const char *key_name(uint16_t keycode) {
+    switch (keycode) {
+        case KC_ENT:  return "ENT";
+        case KC_BSPC: return "BKSP";
+        case KC_TAB:  return "TAB";
+        case KC_ESC:  return "ESC";
+        case KC_DEL:  return "DEL";
+        case KC_LSFT: case KC_RSFT: return "SFT";
+        case KC_LCTL: return "CTL";
+        case KC_LALT: return "ALT";
+        case KC_LGUI: return "GUI";
+        case KC_UP:   return "^";
+        case KC_DOWN: return "v";
+        case KC_LEFT: return "<";
+        case KC_RGHT: return ">";
+        case KC_HOME: return "HOME";
+        case KC_END:  return "END";
+        case KC_PGUP: return "PGUP";
+        case KC_PGDN: return "PGDN";
+        case KC_PSCR: return "PSCR";
+    }
+    if (keycode >= KC_F1 && keycode <= KC_F12) {
+        static char buf[4];   // "F1".."F12"
+        const uint8_t n = keycode - KC_F1 + 1;
+        buf[0] = 'F';
+        if (n < 10) {
+            buf[1] = '0' + n;
+            buf[2] = '\0';
+        } else {
+            buf[1] = '1';
+            buf[2] = '0' + (n - 10);
+            buf[3] = '\0';
+        }
+        return buf;
+    }
+    return "KEY";   // Raise-layer LCTL()/LALT() combos and anything else land here
+}
+
+static void keylog_push(uint16_t keycode) {
+    const bool shifted = (get_mods() | get_weak_mods()) & MOD_MASK_SHIFT;
+    const char c = keylog_char(keycode, shifted);
+
+    if (c) {
+        memmove(g_keylog.queue, g_keylog.queue + 1, KEYLOG_LEN - 1);
+        g_keylog.queue[KEYLOG_LEN - 1] = c;
+        g_keylog.queue[KEYLOG_LEN]     = '\0';
+        g_keylog.current[0] = c;
+        g_keylog.current[1] = '\0';
+    } else {
+        strncpy(g_keylog.current, key_name(keycode), sizeof(g_keylog.current) - 1);
+        g_keylog.current[sizeof(g_keylog.current) - 1] = '\0';
+    }
+}
 
 void keylog_sync_handler(uint8_t in_size, const void *in, uint8_t out_size, void *out) {
-    if (in_size == sizeof(heartbeat)) {
-        memcpy(&heartbeat, in, sizeof(heartbeat));
+    if (in_size == sizeof(g_keylog)) {
+        memcpy(&g_keylog, in, sizeof(g_keylog));
     }
 }
 
 void keyboard_post_init_user(void) {
+    memset(g_keylog.queue, ' ', KEYLOG_LEN);
+    g_keylog.queue[KEYLOG_LEN] = '\0';
     transaction_register_rpc(RPC_ID_KEYLOG_SYNC, keylog_sync_handler);
 }
 
 void housekeeping_task_user(void) {
     if (!is_keyboard_master()) return;
-    static uint32_t last_sync = 0;
-    if (timer_elapsed32(last_sync) > 250) {
-        heartbeat++;
-        transaction_rpc_send(RPC_ID_KEYLOG_SYNC, sizeof(heartbeat), &heartbeat);
-        last_sync = timer_read32();
+    static keylog_sync_t last_sent = {"", ""};
+    static uint32_t      last_sync = 0;
+    if (memcmp(&g_keylog, &last_sent, sizeof(g_keylog)) != 0 || timer_elapsed32(last_sync) > 500) {
+        if (transaction_rpc_send(RPC_ID_KEYLOG_SYNC, sizeof(g_keylog), &g_keylog)) {
+            last_sent = g_keylog;
+            last_sync = timer_read32();
+        }
     }
 }
 
 bool process_record_user(uint16_t keycode, keyrecord_t *record) {
     if (keycode == KC_TAB) {
         tab_held = record->event.pressed;
+    }
+    if (record->event.pressed) {
+        keylog_push(keycode);
     }
     return true;
 }
@@ -245,25 +341,25 @@ static void render_left_oled(void) {
     oled_set_cursor(0, 0);
     oled_write_P(PSTR("Keymo Crone     "), false);
 
+    // Current key: most recent keypress, received from the master over the
+    // custom keylog RPC channel. FIXED WIDTH, always exactly 16 characters:
+    // "> " (2) + exactly 4 chars for current[] (space-padded by explicit
+    // index, not by measuring how far oled_write's cursor advanced -- that
+    // was the bug in an earlier draft of this line) + 10 trailing spaces.
     oled_set_cursor(0, 1);
-    switch (get_highest_layer(layer_state)) {
-        case _LOWER: oled_write_P(PSTR("LOWER "), false); break;
-        case _RAISE: oled_write_P(PSTR("RAISE "), false); break;
-        default:     oled_write_P(PSTR("BASE  "), false); break;
+    oled_write_P(PSTR("> "), false);
+    const uint8_t curlen = strlen(g_keylog.current);
+    for (uint8_t i = 0; i < 4; i++) {
+        oled_write_char(i < curlen ? g_keylog.current[i] : ' ', false);
     }
+    oled_write_P(PSTR("          "), false);   // 10 trailing spaces -> 16 total
 
-    const uint8_t mods = get_mods() | get_weak_mods();
-    oled_write_char(mods & MOD_MASK_CTRL  ? 'C' : '_', false);
-    oled_write_char(mods & MOD_MASK_SHIFT ? 'S' : '_', false);
-    oled_write_char(mods & MOD_MASK_ALT   ? 'A' : '_', false);
-    oled_write_char(mods & MOD_MASK_GUI   ? 'G' : '_', false);
-    oled_write_P(PSTR("      "), false);   // pad to LEFT_TEXT_CHARS (6+4+6=16)
-
+    // Rolling keystroke queue -- oldest on the left, newest on the right.
+    // g_keylog.queue is always exactly KEYLOG_LEN (16) chars + a null
+    // terminator (kept that way by keyboard_post_init_user and keylog_push),
+    // so this write is always exactly 16 characters, filling the row exactly.
     oled_set_cursor(0, 2);
-    const led_t led = host_keyboard_led_state();
-    oled_write_P(led.caps_lock ? PSTR("CAPS") : PSTR("    "), false);
-    oled_write_P(tab_held      ? PSTR(" TAB")   : PSTR("    "), false);
-    oled_write_P(PSTR("        "), false);   // pad to 16 (4+4+8)
+    oled_write(g_keylog.queue, false);
 
     oled_set_cursor(0, 3);
     oled_write_P(PSTR("wpm "), false);
