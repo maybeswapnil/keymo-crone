@@ -1,8 +1,17 @@
 #!/bin/bash
 # Compile and flash a keymap to the Pro Micro.
 #
-#   ./flash.sh            # the real keyboard (default keymap)
-#   ./flash.sh pinscan    # the pin-discovery probe
+#   ./flash.sh                     # rev_pcb, default keymap
+#   ./flash.sh pinscan             # rev_pcb, pin-discovery probe
+#   ./flash.sh default soldered    # rev_soldered, default keymap
+#
+# Two hardware revisions exist with DIFFERENT column pin orders -- the
+# original hand-soldered board (rev_soldered) and a later PCB-based board
+# (rev_pcb), see rev_soldered/keyboard.json and rev_pcb/keyboard.json. QMK
+# only allows keyboard.json at one leaf directory per build target, so each
+# revision is a full standalone keyboard.json, not a merged override.
+# Flashing the wrong revision's hex to a board silently mismatches every
+# column -- always double check which physical board you're flashing.
 #
 # Why this exists instead of `qmk flash`:
 #   QMK's platforms/avr/flash.mk points avrdude at /dev/tty.*, which on macOS
@@ -17,8 +26,13 @@ set -u
 export PATH="/opt/homebrew/opt/avr-gcc@8/bin:$PATH"
 
 KM="${1:-default}"
-KB="handwired/keymo_crone"
-HEX="$HOME/qmk_firmware/handwired_keymo_crone_${KM}.hex"
+REV="${2:-pcb}"
+case "$REV" in
+  pcb)      KB="handwired/keymo_crone/rev_pcb" ;;
+  soldered) KB="handwired/keymo_crone/rev_soldered" ;;
+  *) echo "FATAL: unknown revision '$REV' (expected 'pcb' or 'soldered')"; exit 1 ;;
+esac
+HEX="$HOME/qmk_firmware/handwired_keymo_crone_rev_${REV}_${KM}.hex"
 SPARKFUN_VID=6991   # 0x1B4F
 
 echo ">>> compiling $KB:$KM"
